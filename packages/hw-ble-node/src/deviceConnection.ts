@@ -44,6 +44,8 @@ export default class DeviceConnection implements IDeviceConnection {
 
   private connected: boolean;
 
+  private deviceState: DeviceState;
+
   private readonly pool: PoolData[];
 
   private readonly device: BluetoothDevice;
@@ -52,13 +54,27 @@ export default class DeviceConnection implements IDeviceConnection {
 
   private readonly charTx: BluetoothRemoteGATTCharacteristic;
 
-  constructor(device: BluetoothDevice, charRx: BluetoothRemoteGATTCharacteristic, charTx: BluetoothRemoteGATTCharacteristic) {
+  private readonly charDeviceStatus: BluetoothRemoteGATTCharacteristic;
+
+  constructor(device: BluetoothDevice, charRx: BluetoothRemoteGATTCharacteristic, charTx: BluetoothRemoteGATTCharacteristic, charDeviceStatus: BluetoothRemoteGATTCharacteristic) {
     this.pool = [];
     this.device = device;
     this.charRx = charRx;
     this.charTx = charTx;
+    this.charDeviceStatus = charDeviceStatus;
     this.sequenceNumber = 0;
     this.connected = true;
+    this.deviceState = DeviceState.INITIAL;
+
+    charDeviceStatus.addEventListener("characteristicvaluechanged", async (e) => {
+      e.preventDefault();
+      if (charDeviceStatus.value) {
+        this.updateDeviceStatus(charDeviceStatus.value.getUint8(0));
+      } else {
+        logger.warn("'characteristicvaluechanged' triggered but no data received!");
+      }
+    });
+    charDeviceStatus.startNotifications();
 
     charTx.addEventListener("characteristicvaluechanged", async (e) => {
       e.preventDefault();
@@ -72,6 +88,18 @@ export default class DeviceConnection implements IDeviceConnection {
       }
     });
     charTx.startNotifications();
+  }
+
+  private updateDeviceStatus(deviceStatus: number) {
+    const is_connected = (deviceStatus & 0x1) == 1;
+    const is_in_bootloader_mode = ((deviceStatus >> 1) & 0x1) == 1;
+
+    this.deviceState = is_in_bootloader_mode ? DeviceState.BOOTLOADER : DeviceState.MAIN;
+  }
+
+  private async fetchDeviceStatus() {
+    const status = await this.charDeviceStatus.readValue();
+    this.updateDeviceStatus(status.getUint8(0));
   }
 
   public async getConnectionType(): Promise<string> {
@@ -89,8 +117,9 @@ export default class DeviceConnection implements IDeviceConnection {
     const service = await device.gatt.getPrimaryService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
     const charRx = await service.getCharacteristic("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
     const charTx = await service.getCharacteristic("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+    const charDeviceStatus = await service.getCharacteristic("6E400004-B5A3-F393-E0A9-E50E24DCCA9E");
 
-    return new DeviceConnection(device, charRx, charTx);
+    return new DeviceConnection(device, charRx, charTx, charDeviceStatus);
   }
 
   public static async list() {
@@ -143,15 +172,24 @@ export default class DeviceConnection implements IDeviceConnection {
   }
 
   public async getDeviceState(): Promise<DeviceState> {
-    return DeviceState.MAIN;
+    await this.fetchDeviceStatus();
+    return this.deviceState;
   }
 
   public async send(data: Uint8Array): Promise<void> {
-    const dataToWrite = [
-      ...data,
-      ...new Array(64 - data.length).fill(0x00),
-    ];
-    await this.charRx.writeValueWithoutResponse(Uint8Array.from(dataToWrite));
+    /* 'MAIN' state uses HID, which communicates in 64-byte packets as
+       compared to 'BOOTLOADER' state which is basically a serial port */
+    if (this.deviceState === DeviceState.MAIN) {
+      const dataToWrite = [
+        ...data,
+        ...new Array(64 - data.length).fill(0x00),
+      ];
+      await this.charRx.writeValueWithoutResponse(Uint8Array.from(dataToWrite));
+    } else if (this.deviceState === DeviceState.BOOTLOADER) {
+      await this.charRx.writeValueWithoutResponse(data);
+    } else {
+      logger.warn(`Trying to write ${data.length} bytes in 'INITIAL' state.`);
+    }
   }
 
   public async receive(): Promise<Uint8Array | undefined> {
@@ -163,6 +201,7 @@ export default class DeviceConnection implements IDeviceConnection {
   }
 
   public async destroy(): Promise<void> {
+    this.charDeviceStatus.stopNotifications();
     this.charTx.stopNotifications();
     this.device.gatt.disconnect();
     this.connected = false;
